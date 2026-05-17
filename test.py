@@ -467,4 +467,3 @@ elif choice == "Settings":
     st.subheader("Configured Defect Categories")
     for cat in DEFECT_CATEGORIES:
         st.markdown(f"- {cat}")
- 
