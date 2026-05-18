@@ -2,14 +2,15 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 from PIL import Image
 import io
 import datetime
 import hashlib
 import re
 import plotly.express as px
+import base64
+import cloudinary
+import cloudinary.uploader
 
 # ==========================================
 # 1. CONFIGURATION & CONSTANTS
@@ -18,6 +19,14 @@ st.set_page_config(page_title="SPO Lot Defect System", page_icon="🏭", layout=
 
 DEFECT_CATEGORIES = ["Bend Lead", "Scratches", "Expose Copper", "Contam", "Flashes", "Delam"]
 DATE_FORMAT = "%Y-%m-%d"
+
+# Configure Cloudinary credentials from secrets
+cloudinary.config(
+    cloud_name = st.secrets["CLOUDINARY_CLOUD_NAME"],
+    api_key = st.secrets["CLOUDINARY_API_KEY"],
+    api_secret = st.secrets["CLOUDINARY_API_SECRET"],
+    secure = True
+)
 
 # ==========================================
 # 2. AUTHENTICATION LOGIC
@@ -53,17 +62,16 @@ def logout():
     st.rerun()
 
 # ==========================================
-# 3. GOOGLE API CLIENTS
+# 3. GOOGLE SHEETS CLIENT
 # ==========================================
 @st.cache_resource
 def get_gcp_credentials():
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
-        # Handle newline characters in private keys from Streamlit secrets
         creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
         return service_account.Credentials.from_service_account_info(
             creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
     except Exception as e:
         st.error(f"Missing or invalid Google Cloud credentials in secrets.toml. Error: {e}")
@@ -72,33 +80,24 @@ def get_gcp_credentials():
 def get_sheets_client():
     return gspread.authorize(get_gcp_credentials())
 
-def get_drive_service():
-    return build('drive', 'v3', credentials=get_gcp_credentials())
-
 # ==========================================
-# 4. GOOGLE DRIVE (IMAGE STORAGE)
+# 4. CLOUDINARY (IMAGE STORAGE)
 # ==========================================
-def upload_image_to_drive(image_bytes, filename):
-    service = get_drive_service()
-    folder_id = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
-    
-    file_metadata = {'name': filename, 'parents': [folder_id]}
-    media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=True)
-    
+def upload_image_to_cloudinary(image_bytes, filename):
     try:
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        file_id = file.get('id')
+        # Convert bytes to base64 so Cloudinary can process it securely
+        base64_image = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode('utf-8')
         
-        # Make file public so it can be viewed in Google Sheets
-        service.permissions().create(
-            fileId=file_id,
-            body={'type': 'anywhere', 'role': 'reader'},
-            fields='id'
-        ).execute()
-        
-        return f"https://drive.google.com/uc?export=view&id={file_id}"
+        # Upload to Cloudinary into a specific folder
+        response = cloudinary.uploader.upload(
+            base64_image,
+            public_id=filename.split('.')[0], # Remove .jpg for the public ID
+            folder="SPO_Defects"
+        )
+        # Return the secure HTTPS URL
+        return response.get("secure_url")
     except Exception as e:
-        st.error(f"Failed to upload to Google Drive: {e}")
+        st.error(f"Failed to upload image to Cloudinary: {e}")
         return None
 
 def process_image(image_file, spo, lot_id, defect_type):
@@ -309,13 +308,13 @@ elif choice == "Add Inspection":
             elif len(images_map) != len(selected_defects):
                 st.error("An image must be provided for EVERY selected defect category.")
             else:
-                with st.spinner("Uploading images and saving to database..."):
+                with st.spinner("Uploading images to Cloudinary & saving to database..."):
                     uploaded_links = {}
                     error_flag = False
                     
                     for cat, img_file in images_map.items():
                         img_bytes, filename = process_image(img_file, spo_val, lot_val, cat)
-                        link = upload_image_to_drive(img_bytes, filename)
+                        link = upload_image_to_cloudinary(img_bytes, filename)
                         if link:
                             uploaded_links[cat] = link
                         else:
@@ -461,7 +460,7 @@ elif choice == "Export Data":
 elif choice == "Settings":
     st.title("⚙️ Settings")
     st.subheader("System Configurations")
-    st.markdown("**Storage Mode:** Strictly Google Drive (No Local Backup)")
+    st.markdown("**Storage Mode:** Cloudinary (Free Image Hosting)")
     st.markdown("**Database Mode:** Single Document Google Sheet, Dynamic Tabs")
     
     st.subheader("Configured Defect Categories")
