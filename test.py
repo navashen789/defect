@@ -17,7 +17,6 @@ import cloudinary.uploader
 # ==========================================
 st.set_page_config(page_title="SPO Lot Defect System", page_icon="🏭", layout="wide")
 
-DEFECT_CATEGORIES = ["Bend Lead", "Scratches", "Expose Copper", "Contam", "Flashes", "Delam"]
 DATE_FORMAT = "%Y-%m-%d"
 
 # Configure Cloudinary credentials from secrets
@@ -62,7 +61,7 @@ def logout():
     st.rerun()
 
 # ==========================================
-# 3. GOOGLE SHEETS CLIENT
+# 3. GOOGLE SHEETS CLIENT & DYNAMIC CONFIG
 # ==========================================
 @st.cache_resource
 def get_gcp_credentials():
@@ -80,17 +79,44 @@ def get_gcp_credentials():
 def get_sheets_client():
     return gspread.authorize(get_gcp_credentials())
 
+def open_spreadsheet():
+    client = get_sheets_client()
+    return client.open_by_key(st.secrets["GOOGLE_SHEET_ID"])
+
+def get_dynamic_categories():
+    doc = open_spreadsheet()
+    try:
+        ws = doc.worksheet("System_Config")
+        records = ws.get_all_records()
+        cats = [str(r["Defect Categories"]).strip() for r in records if str(r.get("Defect Categories", "")).strip()]
+        if not cats: return ["Flashes", "Chip", "Lead", "Scratches", "Expose Copper", "Contam"]
+        return cats
+    except gspread.exceptions.WorksheetNotFound:
+        # Create config sheet if it doesn't exist
+        ws = doc.add_worksheet(title="System_Config", rows="100", cols="5")
+        default_cats = ["Flashes", "Chip", "Lead", "Scratches", "Expose Copper", "Contam"]
+        ws.update("A1:A7", [["Defect Categories"]] + [[c] for c in default_cats])
+        return default_cats
+
+def save_dynamic_categories(new_categories):
+    doc = open_spreadsheet()
+    ws = doc.worksheet("System_Config")
+    ws.clear()
+    ws.update(f"A1:A{len(new_categories)+1}", [["Defect Categories"]] + [[c] for c in new_categories])
+
+def get_expected_headers():
+    return ["Date", "Product", "SPO", "Lot ID"] + DEFECT_CATEGORIES + ["Remark", "Created At", "Updated At"]
+
+# Load Categories globally for this session
+DEFECT_CATEGORIES = get_dynamic_categories()
+
 # ==========================================
 # 4. CLOUDINARY (IMAGE STORAGE)
 # ==========================================
 def upload_image_to_cloudinary(image_bytes, filename):
     try:
         base64_image = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode('utf-8')
-        response = cloudinary.uploader.upload(
-            base64_image,
-            public_id=filename.split('.')[0], 
-            folder="SPO_Defects"
-        )
+        response = cloudinary.uploader.upload(base64_image, public_id=filename.split('.')[0], folder="SPO_Defects")
         return response.get("secure_url")
     except Exception as e:
         st.error(f"Failed to upload image to Cloudinary: {e}")
@@ -110,39 +136,41 @@ def process_image(image_file, spo, lot_id, defect_type):
     return output.getvalue(), filename
 
 # ==========================================
-# 5. GOOGLE SHEETS (DATABASE)
+# 5. GOOGLE SHEETS (DATABASE CRUD)
 # ==========================================
-def open_spreadsheet():
-    client = get_sheets_client()
-    return client.open_by_key(st.secrets["GOOGLE_SHEET_ID"])
-
-def get_expected_headers():
-    return ["Date", "SPO", "Lot ID"] + DEFECT_CATEGORIES + ["Remark", "Created At", "Updated At"]
-
 def ensure_headers(worksheet):
     headers = get_expected_headers()
-    if not worksheet.row_values(1):
+    existing = worksheet.row_values(1)
+    if not existing:
         worksheet.insert_row(headers, 1)
         worksheet.format("A1:Z1", {"textFormat": {"bold": True}})
         worksheet.freeze(rows=1)
+    elif len(existing) < len(headers):
+        # Update headers if new categories were added
+        worksheet.update("A1:Z1", [headers])
+
+def sync_all_headers():
+    doc = open_spreadsheet()
+    for ws in doc.worksheets():
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', ws.title):
+            ensure_headers(ws)
 
 def get_or_create_date_sheet(date_str):
     doc = open_spreadsheet()
     try:
         ws = doc.worksheet(date_str)
     except gspread.exceptions.WorksheetNotFound:
-        ws = doc.add_worksheet(title=date_str, rows="1000", cols="26")
+        ws = doc.add_worksheet(title=date_str, rows="1000", cols="30")
     ensure_headers(ws)
     return ws
 
-def append_or_update_record(date_str, spo, lot_id, defect_links, remark):
+def append_or_update_record(date_str, product, spo, lot_id, defect_links, remark):
     ws = get_or_create_date_sheet(date_str)
-    # Read formulas so we can accurately match and overwrite them
     records = ws.get_all_records(value_render_option='FORMULA')
     df = pd.DataFrame(records)
     
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row_map = {"Date": date_str, "SPO": str(spo), "Lot ID": str(lot_id), "Remark": remark, "Updated At": now_str}
+    row_map = {"Date": date_str, "Product": product, "SPO": str(spo), "Lot ID": str(lot_id), "Remark": remark, "Updated At": now_str}
     row_index = -1
     
     if not df.empty and "SPO" in df.columns and "Lot ID" in df.columns:
@@ -158,26 +186,25 @@ def append_or_update_record(date_str, spo, lot_id, defect_links, remark):
         for cat in DEFECT_CATEGORIES:
             row_map.setdefault(cat, "")
 
-    # Inject the new image formulas
+    # Inject image formulas
     for cat, link in defect_links.items():
-        formula = f'=IMAGE("{link}")'
-        if cat in row_map and str(row_map[cat]).strip() and row_map[cat] != 'None':
-            # Append comma separated formulas
-            row_map[cat] = f'{row_map[cat]}, {formula}'
-        else:
+        if link:
+            formula = f'=IMAGE("{link}")'
+            # If replacing an existing one, or appending
             row_map[cat] = formula
+        elif link == "":
+            # Clear it if user deleted it
+            row_map[cat] = ""
 
     headers = get_expected_headers()
     ordered_row = [row_map.get(h, "") for h in headers]
     
     if row_index != -1:
-        # Use user_entered to force Google Sheets to execute the =IMAGE formula
         ws.update(range_name=f"A{row_index}", values=[ordered_row], value_input_option='USER_ENTERED')
     else:
         ws.append_row(ordered_row, value_input_option='USER_ENTERED')
     return True
 
-# --- Helper to clean =IMAGE() wrappers so Streamlit can read the raw URLs ---
 def clean_formula_df(df):
     if df.empty: return df
     for col in df.columns:
@@ -217,22 +244,57 @@ def delete_record(date_str, spo, lot_id):
         pass
     return False
 
-def update_record(old_date, new_date, spo, lot_id, updated_data):
-    if old_date != new_date:
-        delete_record(old_date, spo, lot_id)
-        ws_new = get_or_create_date_sheet(new_date)
-        ws_new.append_row([updated_data.get(h, "") for h in get_expected_headers()], value_input_option='USER_ENTERED')
-    else:
-        doc = open_spreadsheet()
-        ws = doc.worksheet(old_date)
-        df = pd.DataFrame(ws.get_all_records())
-        match = df[(df["SPO"].astype(str) == str(spo)) & (df["Lot ID"].astype(str) == str(lot_id))]
-        if not match.empty:
-            ws.update(range_name=f"A{int(match.index[0]) + 2}", values=[[updated_data.get(h, "") for h in get_expected_headers()]], value_input_option='USER_ENTERED')
-    return True
+# ==========================================
+# 6. HTML GRID GENERATOR (MIMICS EXCEL)
+# ==========================================
+def render_excel_like_table(df):
+    if df.empty:
+        st.info("No records match your filters.")
+        return
+
+    # Define the exact HTML structure to look like the screenshot
+    html = """
+    <style>
+    .excel-table { border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 14px; }
+    .excel-table th { background-color: #f2f2f2; border: 2px solid #000; padding: 8px; text-align: center; }
+    .excel-table td { border: 1px solid #000; padding: 5px; text-align: center; vertical-align: middle; height: 100px;}
+    .img-cell { width: 100px; height: 100px; object-fit: contain; }
+    </style>
+    <table class="excel-table">
+        <thead>
+            <tr>
+                <th>Product</th>
+                <th>SPO</th>
+                <th>Lot ID</th>
+    """
+    for cat in DEFECT_CATEGORIES:
+        html += f"<th>{cat}</th>"
+    html += "<th>Remark</th></tr></thead><tbody>"
+
+    for _, row in df.iterrows():
+        html += f"""
+            <tr>
+                <td>{row.get('Product', '')}</td>
+                <td>{row.get('SPO', '')}</td>
+                <td>{row.get('Lot ID', '')}</td>
+        """
+        for cat in DEFECT_CATEGORIES:
+            img_url = row.get(cat, "")
+            if "http" in str(img_url):
+                # Clean up if multiple exist
+                first_url = str(img_url).split(",")[0].strip()
+                html += f'<td><img src="{first_url}" class="img-cell" onclick="window.open(\'{first_url}\', \'_blank\')"></td>'
+            else:
+                html += "<td></td>"
+        
+        html += f"<td>{row.get('Remark', '')}</td></tr>"
+    
+    html += "</tbody></table>"
+    st.markdown(html, unsafe_allow_html=True)
+
 
 # ==========================================
-# 6. UI ROUTING & INTERFACE
+# 7. UI ROUTING & INTERFACE
 # ==========================================
 init_auth()
 
@@ -258,12 +320,6 @@ choice = st.sidebar.radio("Navigation", nav_options)
 if st.sidebar.button("Logout"):
     logout()
 
-# Helper for displaying image links in Dashboard
-def format_links(val):
-    if not val or val == "None": return ""
-    links = [l.strip() for l in str(val).split(",") if l.strip()]
-    return " | ".join([f'<a href="{l}" target="_blank">🔗 Image {i+1}</a>' for i, l in enumerate(links)])
-
 # --- DASHBOARD ---
 if choice == "Dashboard":
     st.title("📊 Dashboard")
@@ -274,7 +330,7 @@ if choice == "Dashboard":
         st.info("No data available.")
     else:
         total_lots = len(df)
-        defect_counts = {c: df[c].apply(lambda x: len(str(x).split(",")) if pd.notna(x) and str(x).strip() and str(x) != 'None' else 0).sum() for c in DEFECT_CATEGORIES if c in df.columns}
+        defect_counts = {c: df[c].apply(lambda x: 1 if pd.notna(x) and 'http' in str(x) else 0).sum() for c in DEFECT_CATEGORIES if c in df.columns}
         
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Lots Inspected", total_lots)
@@ -293,13 +349,13 @@ if choice == "Dashboard":
 elif choice == "Add Inspection":
     st.title("📥 Add Inspection")
     with st.form("add_form"):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         date_val = c1.date_input("Date", datetime.date.today())
-        spo_val = c2.text_input("SPO").strip()
-        lot_val = c3.text_input("Lot ID").strip()
+        product_val = c2.text_input("Product (e.g. LFPAK)").strip()
+        spo_val = c3.text_input("SPO").strip()
+        lot_val = c4.text_input("Lot ID").strip()
         
         selected_defects = st.multiselect("Defect Categories", DEFECT_CATEGORIES)
-        
         upload_mode = st.radio("Image Input Method", ["Upload File", "Camera"])
         images_map = {}
         
@@ -314,12 +370,12 @@ elif choice == "Add Inspection":
         remark_val = st.text_area("Remark")
         
         if st.form_submit_button("Submit Record", use_container_width=True):
-            if not spo_val or not lot_val or not selected_defects:
-                st.error("SPO, Lot ID, and at least one Defect Category are required.")
-            elif len(images_map) != len(selected_defects):
+            if not spo_val or not lot_val or not product_val:
+                st.error("Product, SPO, and Lot ID are required.")
+            elif selected_defects and len(images_map) != len(selected_defects):
                 st.error("An image must be provided for EVERY selected defect category.")
             else:
-                with st.spinner("Uploading images to Cloudinary & saving to Google Sheets..."):
+                with st.spinner("Uploading images & saving to Google Sheets..."):
                     uploaded_links = {}
                     error_flag = False
                     
@@ -333,7 +389,7 @@ elif choice == "Add Inspection":
                             break
                             
                     if not error_flag:
-                        success = append_or_update_record(date_val.strftime(DATE_FORMAT), spo_val, lot_val, uploaded_links, remark_val)
+                        success = append_or_update_record(date_val.strftime(DATE_FORMAT), product_val, spo_val, lot_val, uploaded_links, remark_val)
                         if success:
                             st.success("Record saved successfully! Images will render in Google Sheets.")
                             st.balloons()
@@ -349,30 +405,13 @@ elif choice == "View Records":
         f_spo = c2.text_input("Filter by SPO").strip()
         f_lot = c3.text_input("Filter by Lot ID").strip()
 
-    df = get_records_by_date(f_date.strftime(DATE_FORMAT)) if f_date else get_all_records()
+    with st.spinner("Fetching Data..."):
+        df = get_records_by_date(f_date.strftime(DATE_FORMAT)) if f_date else get_all_records()
     
     if not df.empty:
         if f_spo: df = df[df["SPO"].astype(str).str.contains(f_spo, case=False)]
         if f_lot: df = df[df["Lot ID"].astype(str).str.contains(f_lot, case=False)]
-        
-        if not df.empty:
-            df_display = df.copy()
-            for cat in DEFECT_CATEGORIES:
-                if cat in df_display.columns:
-                    df_display[cat] = df_display[cat].apply(format_links)
-            st.markdown(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
-            
-            st.subheader("Image Previews")
-            for _, row in df.iterrows():
-                with st.expander(f"{row.get('Date')} | SPO: {row.get('SPO')} | Lot: {row.get('Lot ID')}"):
-                    for cat in DEFECT_CATEGORIES:
-                        if cat in row and str(row[cat]).strip() and str(row[cat]) != 'None':
-                            st.markdown(f"**{cat}**")
-                            for link in str(row[cat]).split(","):
-                                if "http" in link:
-                                    st.image(link.strip(), width=300)
-        else:
-            st.warning("No records match your filters.")
+        render_excel_like_table(df)
     else:
         st.info("No records found.")
 
@@ -380,76 +419,117 @@ elif choice == "View Records":
 elif choice == "Daily Inspection View":
     st.title("📅 Daily View")
     target_date = st.date_input("Select Date", datetime.date.today())
-    df = get_records_by_date(target_date.strftime(DATE_FORMAT))
+    with st.spinner("Fetching Data..."):
+        df = get_records_by_date(target_date.strftime(DATE_FORMAT))
     
     if not df.empty:
-        total_lots = len(df)
         st.subheader(f"Summary for {target_date.strftime(DATE_FORMAT)}")
-        m_cols = st.columns(len(DEFECT_CATEGORIES) + 1)
-        m_cols[0].metric("Total Lots", total_lots)
-        for i, cat in enumerate(DEFECT_CATEGORIES):
-            count = df[cat].apply(lambda x: len(str(x).split(",")) if pd.notna(x) and str(x).strip() and str(x) != 'None' else 0).sum() if cat in df.columns else 0
-            m_cols[i+1].metric(cat, count)
-        
-        df_disp = df.copy()
-        for cat in DEFECT_CATEGORIES:
-            if cat in df_disp.columns:
-                df_disp[cat] = df_disp[cat].apply(format_links)
-        st.markdown(df_disp.to_html(escape=False, index=False), unsafe_allow_html=True)
+        render_excel_like_table(df)
     else:
         st.info("No records for this date.")
 
 # --- EDIT RECORDS ---
 elif choice == "Edit Records":
-    st.title("🛠️ Edit Records")
+    st.title("🛠️ Edit & Manage Records")
+    st.markdown("Search a record to edit text, delete images, or replace images.")
+    
     c1, c2, c3 = st.columns(3)
     s_date = c1.date_input("Record Date", datetime.date.today())
     s_spo = c2.text_input("Record SPO").strip()
     s_lot = c3.text_input("Record Lot ID").strip()
     
     if st.button("Search Record"):
-        df = get_records_by_date(s_date.strftime(DATE_FORMAT))
-        if not df.empty:
-            match = df[(df["SPO"].astype(str) == str(s_spo)) & (df["Lot ID"].astype(str) == str(s_lot))]
-            if not match.empty:
-                st.session_state.edit_target = match.iloc[0].to_dict()
-                st.success("Record found.")
+        with st.spinner("Searching..."):
+            df = get_records_by_date(s_date.strftime(DATE_FORMAT))
+            if not df.empty:
+                match = df[(df["SPO"].astype(str) == str(s_spo)) & (df["Lot ID"].astype(str) == str(s_lot))]
+                if not match.empty:
+                    st.session_state.edit_target = match.iloc[0].to_dict()
+                    st.success("Record found.")
+                else:
+                    st.session_state.edit_target = None
+                    st.error("Record not found.")
             else:
                 st.session_state.edit_target = None
                 st.error("Record not found.")
                 
     if "edit_target" in st.session_state and st.session_state.edit_target:
         row = st.session_state.edit_target
+        
         with st.form("edit_form"):
-            new_date = st.date_input("Date", datetime.datetime.strptime(row["Date"], DATE_FORMAT).date())
-            new_spo = st.text_input("SPO", row["SPO"])
-            new_lot = st.text_input("Lot ID", row["Lot ID"])
+            st.subheader("Text Details")
+            c_ed1, c_ed2, c_ed3 = st.columns(3)
+            new_product = c_ed1.text_input("Product", row.get("Product", ""))
+            new_spo = c_ed2.text_input("SPO", row["SPO"])
+            new_lot = c_ed3.text_input("Lot ID", row["Lot ID"])
             new_rem = st.text_area("Remark", row.get("Remark", ""))
             
-            # Since the URLs were cleaned in `clean_formula_df`, they are bare URLs. 
-            # If the admin updates them, we want them to stay as formulas.
-            links = {cat: st.text_input(f"{cat} Image Link (Keep URL pure)", row.get(cat, "")) for cat in DEFECT_CATEGORIES}
+            st.markdown("---")
+            st.subheader("Manage Images")
             
-            action = st.radio("Action", ["Update", "Delete Record"])
-            if st.form_submit_button("Execute"):
+            # Create a visual grid for editing images
+            image_updates = {}
+            delete_flags = {}
+            
+            for cat in DEFECT_CATEGORIES:
+                st.markdown(f"**{cat}**")
+                col_img, col_act = st.columns([1, 2])
+                
+                current_link = str(row.get(cat, ""))
+                
+                with col_img:
+                    if "http" in current_link:
+                        st.image(current_link.split(",")[0], width=150)
+                    else:
+                        st.info("No image.")
+                        
+                with col_act:
+                    if "http" in current_link:
+                        delete_flags[cat] = st.checkbox(f"🗑️ Delete {cat} Image", key=f"del_{cat}")
+                    image_updates[cat] = st.file_uploader(f"Replace/Add {cat} Image", type=["jpg", "png", "jpeg"], key=f"repl_{cat}")
+                
+                st.markdown("---")
+
+            action = st.radio("Execute Action", ["Update Record", "Delete Entire Record"])
+            
+            if st.form_submit_button("Save Changes"):
                 old_date = s_date.strftime(DATE_FORMAT)
-                if action == "Delete Record":
+                if action == "Delete Entire Record":
                     if delete_record(old_date, row["SPO"], row["Lot ID"]):
-                        st.success("Deleted successfully.")
+                        st.success("Record deleted entirely.")
                         st.session_state.edit_target = None
                         st.rerun()
                 else:
-                    payload = {"Date": new_date.strftime(DATE_FORMAT), "SPO": new_spo, "Lot ID": new_lot, "Remark": new_rem, "Created At": row.get("Created At", ""), "Updated At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                    # Wrap any non-empty updated links back into IMAGE formulas
-                    for cat, link in links.items():
-                        if link and 'IMAGE' not in link:
-                            # Re-wrap just in case
-                            payload[cat] = f'=IMAGE("{link}")' if 'http' in link else link
-                        else:
-                            payload[cat] = link
-                    
-                    if update_record(old_date, new_date.strftime(DATE_FORMAT), row["SPO"], row["Lot ID"], payload):
-                        st.success("Updated successfully.")
+                    with st.spinner("Processing Updates..."):
+                        # Build the defect links payload
+                        final_links = {}
+                        error_flag = False
+                        
+                        for cat in DEFECT_CATEGORIES:
+                            current_url = str(row.get(cat, ""))
+                            
+                            # 1. Did they upload a new image?
+                            if image_updates[cat] is not None:
+                                img_bytes, filename = process_image(image_updates[cat], new_spo, new_lot, cat)
+                                new_url = upload_image_to_cloudinary(img_bytes, filename)
+                                if new_url:
+                                    final_links[cat] = new_url
+                                else:
+                                    error_flag = True
+                            
+                            # 2. Did they check the delete box?
+                            elif cat in delete_flags and delete_flags[cat]:
+                                final_links[cat] = "" # Clear the cell
+                                
+                            # 3. Otherwise, keep existing
+                            else:
+                                final_links[cat] = current_url
+                        
+                        if not error_flag:
+                            # Save to Google Sheets
+                            append_or_update_record(old_date, new_product, new_spo, new_lot, final_links, new_rem)
+                            st.success("Record updated successfully!")
+                            st.session_state.edit_target = None
 
 # --- EXPORT DATA ---
 elif choice == "Export Data":
@@ -467,7 +547,6 @@ elif choice == "Export Data":
             
     if not df_export.empty:
         st.success(f"Prepared {len(df_export)} records.")
-        
         csv = df_export.to_csv(index=False).encode('utf-8')
         excel_io = io.BytesIO()
         with pd.ExcelWriter(excel_io, engine='openpyxl') as w:
@@ -479,12 +558,42 @@ elif choice == "Export Data":
 
 # --- SETTINGS ---
 elif choice == "Settings":
-    st.title("⚙️ Settings")
-    st.subheader("System Configurations")
-    st.markdown("**Storage Mode:** Cloudinary (Free Image Hosting)")
-    st.markdown("**Database Mode:** Single Document Google Sheet, Dynamic Tabs")
-    st.markdown("**Image Rendering:** Google Sheets `=IMAGE()` Formula Mode Active")
+    st.title("⚙️ System Settings")
+    st.subheader("Manage Defect Categories")
+    st.markdown("Categories listed here will automatically appear as columns in your Google Sheets and Dashboard.")
     
-    st.subheader("Configured Defect Categories")
-    for cat in DEFECT_CATEGORIES:
-        st.markdown(f"- {cat}")
+    current_cats = get_dynamic_categories()
+    
+    # Display current categories
+    st.write("Current Active Categories:")
+    for cat in current_cats:
+        st.markdown(f"- **{cat}**")
+        
+    st.markdown("---")
+    
+    with st.form("category_form"):
+        new_cat = st.text_input("Add New Defect Category")
+        
+        # Multiselect to remove
+        cats_to_remove = st.multiselect("Remove Categories", current_cats)
+        
+        if st.form_submit_button("Update Categories"):
+            updated_cats = current_cats.copy()
+            
+            if new_cat and new_cat not in updated_cats:
+                updated_cats.append(new_cat.strip())
+            
+            for c in cats_to_remove:
+                if c in updated_cats:
+                    updated_cats.remove(c)
+                    
+            if len(updated_cats) == 0:
+                st.error("You must have at least one defect category.")
+            else:
+                with st.spinner("Saving categories and syncing database headers..."):
+                    save_dynamic_categories(updated_cats)
+                    # Global variable update
+                    DEFECT_CATEGORIES = updated_cats 
+                    sync_all_headers()
+                    st.success("Categories updated! All Google Sheet tabs have been synced.")
+                    st.rerun()
