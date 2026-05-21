@@ -7,10 +7,12 @@ import io
 import datetime
 import re
 import base64
+import math
 import cloudinary
 import cloudinary.uploader
 from pillow_heif import register_heif_opener
 from pyzbar.pyzbar import decode
+from streamlit_geolocation import streamlit_geolocation
 
 # Enable HEIC support in PIL
 register_heif_opener()
@@ -24,6 +26,11 @@ DATE_FORMAT = "%Y-%m-%d"
 MAX_FILE_SIZE_MB = 10
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
+# Geofence Constants
+FACTORY_LAT = 4.574355483324381
+FACTORY_LON = 101.10586181352994
+ALLOWED_RADIUS_METERS = 100
+
 # Configure Cloudinary credentials from secrets
 cloudinary.config(
     cloud_name = st.secrets["CLOUDINARY_CLOUD_NAME"],
@@ -33,13 +40,54 @@ cloudinary.config(
 )
 
 # ==========================================
-# 2. STATE INITIALIZATION
+# 2. GEOFENCE SECURITY GATEKEEPER
+# ==========================================
+def get_distance_meters(lat1, lon1, lat2, lon2):
+    """Calculates distance between two GPS points using the Haversine formula."""
+    R = 6371000 # Radius of Earth in meters
+    phi_1 = math.radians(lat1)
+    phi_2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = math.sin(delta_phi / 2.0) ** 2 + \
+        math.cos(phi_1) * math.cos(phi_2) * \
+        math.sin(delta_lambda / 2.0) ** 2
+    
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+st.title("📍 Location Verification Required")
+st.write("You must be on the factory floor to access this system.")
+
+# Request user location via browser
+location = streamlit_geolocation()
+
+if location and location.get('latitude') is not None and location.get('longitude') is not None:
+    user_lat = location['latitude']
+    user_lon = location['longitude']
+    
+    distance = get_distance_meters(FACTORY_LAT, FACTORY_LON, user_lat, user_lon)
+    
+    if distance <= ALLOWED_RADIUS_METERS:
+        st.success(f"Location verified! Distance: {int(distance)}m.")
+        st.divider()
+    else:
+        st.error(f"Access Denied. You are {int(distance)} meters away. You must be within {ALLOWED_RADIUS_METERS}m of the factory.")
+        st.stop() # Immediately halts execution of the rest of the script
+else:
+    st.warning("Please click the button above and allow location access in your browser to continue.")
+    st.stop() # Halts execution until location is provided
+
+
+# ==========================================
+# 3. STATE INITIALIZATION
 # ==========================================
 if "defect_categories" not in st.session_state:
     st.session_state.defect_categories = ["Bend Lead", "Scratches", "Expose Copper", "Contam", "Flashes", "Delam"]
 
 # ==========================================
-# 3. GOOGLE SHEETS CLIENT
+# 4. GOOGLE SHEETS CLIENT
 # ==========================================
 @st.cache_resource
 def get_gcp_credentials():
@@ -58,7 +106,7 @@ def get_sheets_client():
     return gspread.authorize(get_gcp_credentials())
 
 # ==========================================
-# 4. CLOUDINARY & MAX SECURITY IMAGE PROCESSING
+# 5. CLOUDINARY & MAX SECURITY IMAGE PROCESSING
 # ==========================================
 def sanitize_and_process_image(image_file, spo, lot_id, defect_type):
     """
@@ -115,7 +163,7 @@ def upload_image_to_cloudinary(image_bytes, filename):
         return None
 
 # ==========================================
-# 5. GOOGLE SHEETS (DATABASE)
+# 6. GOOGLE SHEETS (DATABASE)
 # ==========================================
 def open_spreadsheet():
     client = get_sheets_client()
@@ -178,7 +226,7 @@ def append_or_update_record(date_str, spo, lot_id, defect_links, remark):
     return True
 
 # ==========================================
-# 6. UI ROUTING & INTERFACE
+# 7. UI ROUTING & INTERFACE
 # ==========================================
 
 # Sidebar Navigation (Stripped Down)
