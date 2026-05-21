@@ -29,7 +29,7 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # Geofence Constants
 FACTORY_LAT = 4.574355483324381
 FACTORY_LON = 101.10586181352994
-ALLOWED_RADIUS_METERS = 300
+ALLOWED_RADIUS_METERS = 100
 
 # Configure Cloudinary credentials from secrets
 cloudinary.config(
@@ -79,15 +79,8 @@ else:
     st.warning("Please click the button above and allow location access in your browser to continue.")
     st.stop() # Halts execution until location is provided
 
-
 # ==========================================
-# 3. STATE INITIALIZATION
-# ==========================================
-if "defect_categories" not in st.session_state:
-    st.session_state.defect_categories = ["Bend Lead", "Scratches", "Expose Copper", "Contam", "Flashes", "Delam"]
-
-# ==========================================
-# 4. GOOGLE SHEETS CLIENT
+# 3. GOOGLE SHEETS CLIENT Setup
 # ==========================================
 @st.cache_resource
 def get_gcp_credentials():
@@ -105,8 +98,50 @@ def get_gcp_credentials():
 def get_sheets_client():
     return gspread.authorize(get_gcp_credentials())
 
+def open_spreadsheet():
+    client = get_sheets_client()
+    return client.open_by_key(st.secrets["GOOGLE_SHEET_ID"])
+
 # ==========================================
-# 5. CLOUDINARY & MAX SECURITY IMAGE PROCESSING
+# 4. SYSTEM CONFIG (SYNC DEFECTS WITH SHEETS)
+# ==========================================
+def get_system_config_sheet():
+    doc = open_spreadsheet()
+    try:
+        ws = doc.worksheet("System_Config")
+    except gspread.exceptions.WorksheetNotFound:
+        # Create it if it doesn't exist
+        ws = doc.add_worksheet(title="System_Config", rows="100", cols="5")
+        default_cats = [["Defect Categories"], ["Bend Lead"], ["Scratches"], ["Expose Copper"], ["Contam"], ["Flashes"], ["Delam"]]
+        ws.update(range_name="A1", values=default_cats, value_input_option="USER_ENTERED")
+    return ws
+
+def load_defect_categories():
+    ws = get_system_config_sheet()
+    records = ws.col_values(1) # Get all values in Column A
+    if len(records) > 1:
+        # Skip the header row and store in session state
+        st.session_state.defect_categories = [r.strip() for r in records[1:] if r.strip()]
+    else:
+        st.session_state.defect_categories = []
+
+def save_defect_categories():
+    ws = get_system_config_sheet()
+    # Clear the column to prevent lingering old data
+    ws.batch_clear(["A:A"])
+    # Prepare data to write back
+    data = [["Defect Categories"]] + [[cat] for cat in st.session_state.defect_categories]
+    ws.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
+
+# ==========================================
+# 5. STATE INITIALIZATION
+# ==========================================
+if "defect_categories" not in st.session_state:
+    with st.spinner("Loading configuration from Google Sheets..."):
+        load_defect_categories()
+
+# ==========================================
+# 6. CLOUDINARY & MAX SECURITY IMAGE PROCESSING
 # ==========================================
 def sanitize_and_process_image(image_file, spo, lot_id, defect_type):
     """
@@ -115,24 +150,17 @@ def sanitize_and_process_image(image_file, spo, lot_id, defect_type):
     """
     image_bytes = image_file.getvalue()
     
-    # 1. Hard Size Limit
     if len(image_bytes) > MAX_FILE_SIZE_BYTES:
         raise ValueError(f"File exceeds the {MAX_FILE_SIZE_MB}MB strict limit.")
 
     try:
-        # 2. Structural Verification
         img = Image.open(io.BytesIO(image_bytes))
-        img.verify() # Ensures it's a real image file, not a renamed executable
+        img.verify() 
         
-        # 3. Payload Destruction (Re-encoding)
-        # We reopen it because verify() closes the file pointer
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        
-        # Create a blank canvas and paste only the visual pixels (drops EXIF/malware)
         clean_img = Image.new("RGB", img.size)
         clean_img.putdata(list(img.getdata()))
         
-        # Save the sanitized image to memory
         output = io.BytesIO()
         clean_img.save(output, format="JPEG", quality=85)
         sanitized_bytes = output.getvalue()
@@ -140,7 +168,6 @@ def sanitize_and_process_image(image_file, spo, lot_id, defect_type):
     except (UnidentifiedImageError, Exception) as e:
         raise ValueError("Corrupted, disguised, or malicious file detected. Upload blocked.")
 
-    # Format the filename
     clean_spo = "".join(c for c in str(spo) if c.isalnum())
     clean_lot = "".join(c for c in str(lot_id) if c.isalnum() or c in ('-', '_'))
     clean_cat = "".join(c for c in str(defect_type) if c.isalnum())
@@ -163,12 +190,8 @@ def upload_image_to_cloudinary(image_bytes, filename):
         return None
 
 # ==========================================
-# 6. GOOGLE SHEETS (DATABASE)
+# 7. GOOGLE SHEETS (DATABASE HANDLING)
 # ==========================================
-def open_spreadsheet():
-    client = get_sheets_client()
-    return client.open_by_key(st.secrets["GOOGLE_SHEET_ID"])
-
 def get_expected_headers():
     return ["Date", "SPO", "Lot ID"] + st.session_state.defect_categories + ["Remark", "Created At", "Updated At"]
 
@@ -226,7 +249,7 @@ def append_or_update_record(date_str, spo, lot_id, defect_links, remark):
     return True
 
 # ==========================================
-# 7. UI ROUTING & INTERFACE
+# 8. UI ROUTING & INTERFACE
 # ==========================================
 
 # Sidebar Navigation (Stripped Down)
@@ -251,7 +274,6 @@ if choice == "Add Inspection":
             barcode_pic = st.camera_input("Take a picture of the Lot ID Barcode")
             if barcode_pic:
                 img = Image.open(barcode_pic)
-                # Enhancement: Convert image to grayscale to boost scanner accuracy
                 gray_img = ImageOps.grayscale(img)
                 decoded = decode(gray_img)
                 
@@ -278,7 +300,6 @@ if choice == "Add Inspection":
         if final_defects_list:
             for cat in final_defects_list:
                 if upload_mode == "Upload File":
-                    # Strictly lock file types to JPG, JPEG, and HEIC
                     img = st.file_uploader(f"Image for {cat} (Max 10MB)", type=["jpg", "jpeg", "heic"], key=f"up_{cat}")
                 else:
                     img = st.camera_input(f"Capture {cat}", key=f"cam_{cat}")
@@ -293,15 +314,16 @@ if choice == "Add Inspection":
                 st.error("An image must be provided for EVERY selected defect.")
             else:
                 with st.spinner("Sanitizing images & saving to secure database..."):
+                    # Check if a custom defect was added, update state AND Google Sheets
                     if new_custom_defect and new_custom_defect not in st.session_state.defect_categories:
                         st.session_state.defect_categories.append(new_custom_defect.strip())
+                        save_defect_categories()
 
                     uploaded_links = {}
                     error_flag = False
                     
                     for cat, img_file in images_map.items():
                         try:
-                            # Run the Max Security check
                             img_bytes, filename = sanitize_and_process_image(img_file, spo_val, lot_val_input, cat)
                             link = upload_image_to_cloudinary(img_bytes, filename)
                             
@@ -326,13 +348,14 @@ if choice == "Add Inspection":
 # --- SETTINGS ---
 elif choice == "Settings":
     st.title("⚙️ Settings")
-    st.markdown("Modify the global list of inspection defect types.")
+    st.markdown("Modify the global list of inspection defect types. Changes will be saved directly to the **System_Config** tab in Google Sheets.")
     
     st.subheader("Add Defect Category")
     new_defect = st.text_input("New Defect Name")
     if st.button("Add Defect", use_container_width=True):
         if new_defect and new_defect not in st.session_state.defect_categories:
             st.session_state.defect_categories.append(new_defect.strip())
+            save_defect_categories() # Syncs directly to Google Sheets
             st.success(f"Added '{new_defect}'!")
             st.rerun()
         elif new_defect in st.session_state.defect_categories:
@@ -344,6 +367,7 @@ elif choice == "Settings":
     if st.button("Remove Defect", use_container_width=True):
         if len(st.session_state.defect_categories) > 1:
             st.session_state.defect_categories.remove(remove_defect)
+            save_defect_categories() # Syncs directly to Google Sheets
             st.success(f"Removed '{remove_defect}'.")
             st.rerun()
         else:
