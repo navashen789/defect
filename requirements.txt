@@ -8,3 +8,4 @@ openpyxl
 cloudinary
 pillow-heif
 pyzbar
+streamlit-geolocation
