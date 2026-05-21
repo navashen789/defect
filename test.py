@@ -17,6 +17,7 @@ import cloudinary.uploader
 # ==========================================
 st.set_page_config(page_title="SPO Lot Defect System", page_icon="🏭", layout="wide")
 
+DEFECT_CATEGORIES = ["Bend Lead", "Scratches", "Expose Copper", "Contam", "Flashes", "Delam"]
 DATE_FORMAT = "%Y-%m-%d"
 
 # Configure Cloudinary credentials from secrets
@@ -28,25 +29,17 @@ cloudinary.config(
 )
 
 # ==========================================
-# 2. STATE INITIALIZATION & AUTH LOGIC
+# 2. AUTHENTICATION LOGIC
 # ==========================================
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
-def init_system_state():
-    # Initialize dynamic users
-    if "users" not in st.session_state:
-        st.session_state.users = {
-            "Prabjoth": {"password": hash_password("1234"), "role": "Admin", "name": "Prabjoth (Master)"},
-            "user1": {"password": hash_password("1234"), "role": "Inspector", "name": "Line Inspector 1"},
-            "user2": {"password": hash_password("1234"), "role": "Inspector", "name": "Line Inspector 2"}
-        }
-    # Initialize dynamic defect categories
-    if "defect_categories" not in st.session_state:
-        st.session_state.defect_categories = ["Bend Lead", "Scratches", "Expose Copper", "Contam", "Flashes", "Delam"]
+USER_CREDENTIALS = {
+    "admin": {"password": hash_password("admin123"), "role": "Admin", "name": "System Admin"},
+    "inspector": {"password": hash_password("inspect123"), "role": "Inspector", "name": "Line Inspector"}
+}
 
 def init_auth():
-    init_system_state()
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
         st.session_state.username = None
@@ -54,11 +47,11 @@ def init_auth():
         st.session_state.user_fullname = None
 
 def login(username, password):
-    if username in st.session_state.users and st.session_state.users[username]["password"] == hash_password(password):
+    if username in USER_CREDENTIALS and USER_CREDENTIALS[username]["password"] == hash_password(password):
         st.session_state.authenticated = True
         st.session_state.username = username
-        st.session_state.role = st.session_state.users[username]["role"]
-        st.session_state.user_fullname = st.session_state.users[username]["name"]
+        st.session_state.role = USER_CREDENTIALS[username]["role"]
+        st.session_state.user_fullname = USER_CREDENTIALS[username]["name"]
         return True
     return False
 
@@ -92,12 +85,16 @@ def get_sheets_client():
 # ==========================================
 def upload_image_to_cloudinary(image_bytes, filename):
     try:
+        # Convert bytes to base64 so Cloudinary can process it securely
         base64_image = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode('utf-8')
+        
+        # Upload to Cloudinary into a specific folder
         response = cloudinary.uploader.upload(
             base64_image,
-            public_id=filename.split('.')[0], 
+            public_id=filename.split('.')[0], # Remove .jpg for the public ID
             folder="SPO_Defects"
         )
+        # Return the secure HTTPS URL
         return response.get("secure_url")
     except Exception as e:
         st.error(f"Failed to upload image to Cloudinary: {e}")
@@ -124,7 +121,7 @@ def open_spreadsheet():
     return client.open_by_key(st.secrets["GOOGLE_SHEET_ID"])
 
 def get_expected_headers():
-    return ["Date", "SPO", "Lot ID"] + st.session_state.defect_categories + ["Remark", "Created At", "Updated At"]
+    return ["Date", "SPO", "Lot ID"] + DEFECT_CATEGORIES + ["Remark", "Created At", "Updated At"]
 
 def ensure_headers(worksheet):
     headers = get_expected_headers()
@@ -156,12 +153,12 @@ def append_or_update_record(date_str, spo, lot_id, defect_links, remark):
         if not match.empty:
             row_index = int(match.index[0]) + 2
             row_map["Created At"] = df.iloc[match.index[0]].get("Created At", now_str)
-            for cat in st.session_state.defect_categories:
+            for cat in DEFECT_CATEGORIES:
                 row_map[cat] = df.iloc[match.index[0]].get(cat, "")
     
     if "Created At" not in row_map:
         row_map["Created At"] = now_str
-        for cat in st.session_state.defect_categories:
+        for cat in DEFECT_CATEGORIES:
             row_map.setdefault(cat, "")
 
     for cat, link in defect_links.items():
@@ -174,15 +171,15 @@ def append_or_update_record(date_str, spo, lot_id, defect_links, remark):
     ordered_row = [row_map.get(h, "") for h in headers]
     
     if row_index != -1:
-        ws.update(range_name=f"A{row_index}", values=[ordered_row])
+        ws.update(range_name=f"A{row_index}", values=[ordered_row], value_input_option="USER_ENTERED")
     else:
-        ws.append_row(ordered_row)
+        ws.append_row(ordered_row, value_input_option="USER_ENTERED")
     return True
 
 def get_records_by_date(date_str):
     doc = open_spreadsheet()
     try:
-        return pd.DataFrame(doc.worksheet(date_str).get_all_records())
+        return pd.DataFrame(doc.worksheet(date_str).get_all_records(value_render_option='FORMULA'))
     except gspread.exceptions.WorksheetNotFound:
         return pd.DataFrame()
 
@@ -191,7 +188,7 @@ def get_all_records():
     all_dfs = []
     for ws in doc.worksheets():
         if re.match(r'^\d{4}-\d{2}-\d{2}$', ws.title):
-            data = ws.get_all_records()
+            data = ws.get_all_records(value_render_option='FORMULA')
             if data:
                 all_dfs.append(pd.DataFrame(data))
     return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
@@ -213,14 +210,14 @@ def update_record(old_date, new_date, spo, lot_id, updated_data):
     if old_date != new_date:
         delete_record(old_date, spo, lot_id)
         ws_new = get_or_create_date_sheet(new_date)
-        ws_new.append_row([updated_data.get(h, "") for h in get_expected_headers()])
+        ws_new.append_row([updated_data.get(h, "") for h in get_expected_headers()], value_input_option="USER_ENTERED")
     else:
         doc = open_spreadsheet()
         ws = doc.worksheet(old_date)
         df = pd.DataFrame(ws.get_all_records())
         match = df[(df["SPO"].astype(str) == str(spo)) & (df["Lot ID"].astype(str) == str(lot_id))]
         if not match.empty:
-            ws.update(range_name=f"A{int(match.index[0]) + 2}", values=[[updated_data.get(h, "") for h in get_expected_headers()]])
+            ws.update(range_name=f"A{int(match.index[0]) + 2}", values=[[updated_data.get(h, "") for h in get_expected_headers()]], value_input_option="USER_ENTERED")
     return True
 
 # ==========================================
@@ -231,8 +228,8 @@ init_auth()
 if not st.session_state.authenticated:
     st.markdown("<h2 style='text-align: center;'>🏭 SPO Lot Defect System</h2>", unsafe_allow_html=True)
     with st.form("login_form"):
-        user_input = st.text_input("Username")
-        pwd_input = st.text_input("Password", type="password")
+        user_input = st.text_input("Username").strip()
+        pwd_input = st.text_input("Password", type="password").strip()
         if st.form_submit_button("Login", use_container_width=True):
             if login(user_input, pwd_input):
                 st.rerun()
@@ -242,7 +239,7 @@ if not st.session_state.authenticated:
 
 # Sidebar Navigation
 st.sidebar.markdown(f"**User:** {st.session_state.user_fullname} ({st.session_state.role})")
-nav_options = ["Dashboard", "Add Inspection", "View Records", "Daily Inspection View", "My Profile"]
+nav_options = ["Dashboard", "Add Inspection", "View Records", "Daily Inspection View"]
 if st.session_state.role == "Admin":
     nav_options += ["Edit Records", "Export Data", "Settings"]
 
@@ -250,11 +247,21 @@ choice = st.sidebar.radio("Navigation", nav_options)
 if st.sidebar.button("Logout"):
     logout()
 
-# Helper for displaying image links
+# Helpers for displaying image links and parsing formulas
+def extract_urls_from_formula(val):
+    if not val: return []
+    val_str = str(val)
+    # Extract the URL from inside the =IMAGE("url") formula
+    urls = re.findall(r'IMAGE\("(.*?)"\)', val_str)
+    # Fallback just in case it's an old record with standard text links
+    if not urls:
+        urls = [l.strip() for l in val_str.split(",") if l.strip()]
+    return urls
+
 def format_links(val):
-    if not val: return ""
-    links = [l.strip() for l in str(val).split(",") if l.strip()]
-    return " | ".join([f'<a href="{l}" target="_blank">🔗 Image {i+1}</a>' for i, l in enumerate(links)])
+    urls = extract_urls_from_formula(val)
+    if not urls: return ""
+    return " | ".join([f'<a href="{url}" target="_blank">🔗 Image {i+1}</a>' for i, url in enumerate(urls)])
 
 # --- DASHBOARD ---
 if choice == "Dashboard":
@@ -266,12 +273,13 @@ if choice == "Dashboard":
         st.info("No data available.")
     else:
         total_lots = len(df)
-        defect_counts = {c: df[c].apply(lambda x: len(str(x).split(",")) if pd.notna(x) and str(x).strip() else 0).sum() for c in st.session_state.defect_categories if c in df.columns}
+        # Use extract_urls_from_formula to get the accurate count of images in formulas
+        defect_counts = {c: df[c].apply(lambda x: len(extract_urls_from_formula(x)) if pd.notna(x) and str(x).strip() else 0).sum() for c in DEFECT_CATEGORIES if c in df.columns}
         
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Lots Inspected", total_lots)
         c2.metric("Total Defects", sum(defect_counts.values()))
-        c3.metric("Defects per Lot", round(sum(defect_counts.values()) / total_lots, 2) if total_lots > 0 else 0)
+        c3.metric("Defects per Lot", round(sum(defect_counts.values()) / total_lots, 2))
         
         st.markdown("---")
         col1, col2 = st.columns(2)
@@ -290,7 +298,7 @@ elif choice == "Add Inspection":
         spo_val = c2.text_input("SPO").strip()
         lot_val = c3.text_input("Lot ID").strip()
         
-        selected_defects = st.multiselect("Defect Categories", st.session_state.defect_categories)
+        selected_defects = st.multiselect("Defect Categories", DEFECT_CATEGORIES)
         
         upload_mode = st.radio("Image Input Method", ["Upload File", "Camera"])
         images_map = {}
@@ -319,7 +327,8 @@ elif choice == "Add Inspection":
                         img_bytes, filename = process_image(img_file, spo_val, lot_val, cat)
                         link = upload_image_to_cloudinary(img_bytes, filename)
                         if link:
-                            uploaded_links[cat] = link
+                            # Wrap the Cloudinary link in the Google Sheets IMAGE formula
+                            uploaded_links[cat] = f'=IMAGE("{link}")'
                         else:
                             error_flag = True
                             break
@@ -349,7 +358,7 @@ elif choice == "View Records":
         
         if not df.empty:
             df_display = df.copy()
-            for cat in st.session_state.defect_categories:
+            for cat in DEFECT_CATEGORIES:
                 if cat in df_display.columns:
                     df_display[cat] = df_display[cat].apply(format_links)
             st.markdown(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
@@ -357,11 +366,13 @@ elif choice == "View Records":
             st.subheader("Image Previews")
             for _, row in df.iterrows():
                 with st.expander(f"{row.get('Date')} | SPO: {row.get('SPO')} | Lot: {row.get('Lot ID')}"):
-                    for cat in st.session_state.defect_categories:
+                    for cat in DEFECT_CATEGORIES:
                         if cat in row and str(row[cat]).strip():
                             st.markdown(f"**{cat}**")
-                            for link in str(row[cat]).split(","):
-                                st.image(link.strip(), width=300)
+                            # Extract URL from formula to render it in Streamlit
+                            urls = extract_urls_from_formula(row[cat])
+                            for link in urls:
+                                st.image(link, width=300)
         else:
             st.warning("No records match your filters.")
     else:
@@ -376,14 +387,14 @@ elif choice == "Daily Inspection View":
     if not df.empty:
         total_lots = len(df)
         st.subheader(f"Summary for {target_date.strftime(DATE_FORMAT)}")
-        m_cols = st.columns(len(st.session_state.defect_categories) + 1)
+        m_cols = st.columns(len(DEFECT_CATEGORIES) + 1)
         m_cols[0].metric("Total Lots", total_lots)
-        for i, cat in enumerate(st.session_state.defect_categories):
-            count = df[cat].apply(lambda x: len(str(x).split(",")) if pd.notna(x) and str(x).strip() else 0).sum() if cat in df.columns else 0
+        for i, cat in enumerate(DEFECT_CATEGORIES):
+            count = df[cat].apply(lambda x: len(extract_urls_from_formula(x)) if pd.notna(x) and str(x).strip() else 0).sum() if cat in df.columns else 0
             m_cols[i+1].metric(cat, count)
         
         df_disp = df.copy()
-        for cat in st.session_state.defect_categories:
+        for cat in DEFECT_CATEGORIES:
             if cat in df_disp.columns:
                 df_disp[cat] = df_disp[cat].apply(format_links)
         st.markdown(df_disp.to_html(escape=False, index=False), unsafe_allow_html=True)
@@ -417,7 +428,7 @@ elif choice == "Edit Records":
             new_lot = st.text_input("Lot ID", row["Lot ID"])
             new_rem = st.text_area("Remark", row.get("Remark", ""))
             
-            links = {cat: st.text_input(f"{cat} Image Link", row.get(cat, "")) for cat in st.session_state.defect_categories}
+            links = {cat: st.text_input(f"{cat} Image Link", row.get(cat, "")) for cat in DEFECT_CATEGORIES}
             
             action = st.radio("Action", ["Update", "Delete Record"])
             if st.form_submit_button("Execute"):
@@ -459,116 +470,13 @@ elif choice == "Export Data":
         c1.download_button("Download CSV", data=csv, file_name="export.csv", mime="text/csv", use_container_width=True)
         c2.download_button("Download Excel", data=excel_io.getvalue(), file_name="export.xlsx", use_container_width=True)
 
-# --- MY PROFILE ---
-elif choice == "My Profile":
-    st.title("👤 My Profile")
-    st.markdown("Update your personal account details.")
-    
-    st.subheader("Change Username")
-    new_username = st.text_input("New Username", value=st.session_state.username)
-    if st.button("Update Username"):
-        if new_username == st.session_state.username:
-            st.info("Username is identical.")
-        elif new_username in st.session_state.users:
-            st.error("This username is already taken.")
-        else:
-            # Transfer user data to new key
-            st.session_state.users[new_username] = st.session_state.users.pop(st.session_state.username)
-            st.session_state.username = new_username
-            st.success("Username updated successfully!")
-            st.rerun()
-            
-    st.markdown("---")
-    st.subheader("Change Password")
-    old_password = st.text_input("Current Password", type="password")
-    new_password = st.text_input("New Password", type="password")
-    confirm_password = st.text_input("Confirm New Password", type="password")
-    
-    if st.button("Update Password"):
-        current_hash = st.session_state.users[st.session_state.username]["password"]
-        if hash_password(old_password) != current_hash:
-            st.error("Incorrect current password.")
-        elif new_password != confirm_password:
-            st.error("New passwords do not match.")
-        elif len(new_password) < 4:
-            st.error("Password must be at least 4 characters.")
-        else:
-            st.session_state.users[st.session_state.username]["password"] = hash_password(new_password)
-            st.success("Password updated successfully!")
-
-# --- SETTINGS (ADMIN ONLY) ---
+# --- SETTINGS ---
 elif choice == "Settings":
-    st.title("⚙️ Settings (Admin)")
+    st.title("⚙️ Settings")
+    st.subheader("System Configurations")
+    st.markdown("**Storage Mode:** Cloudinary (Free Image Hosting)")
+    st.markdown("**Database Mode:** Single Document Google Sheet, Dynamic Tabs")
     
-    # 1. Defect Category Management
-    st.header("1. Defect Category Management")
-    st.markdown("Modify the global list of inspection defect types.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Add Defect Category")
-        new_defect = st.text_input("New Defect Name")
-        if st.button("Add Defect"):
-            if new_defect and new_defect not in st.session_state.defect_categories:
-                st.session_state.defect_categories.append(new_defect.strip())
-                st.success(f"Added '{new_defect}'!")
-                st.rerun()
-            elif new_defect in st.session_state.defect_categories:
-                st.error("Category already exists.")
-    
-    with col2:
-        st.subheader("Remove Defect Category")
-        remove_defect = st.selectbox("Select Defect to Remove", st.session_state.defect_categories)
-        if st.button("Remove Defect"):
-            if len(st.session_state.defect_categories) > 1:
-                st.session_state.defect_categories.remove(remove_defect)
-                st.success(f"Removed '{remove_defect}'.")
-                st.rerun()
-            else:
-                st.error("You must have at least one defect category.")
-
-    st.markdown("---")
-    
-    # 2. User Management
-    st.header("2. User Management")
-    st.markdown("Add, remove, or reset passwords for system users.")
-    
-    t1, t2, t3 = st.tabs(["Add User", "Remove User", "Reset Password"])
-    
-    with t1:
-        new_user_id = st.text_input("Username (Login ID)")
-        new_user_name = st.text_input("Full Name")
-        new_user_pwd = st.text_input("Temporary Password", type="password")
-        new_user_role = st.selectbox("Role", ["Inspector", "Admin"])
-        if st.button("Create User"):
-            if not new_user_id or not new_user_pwd:
-                st.error("Username and Password are required.")
-            elif new_user_id in st.session_state.users:
-                st.error("Username already exists.")
-            else:
-                st.session_state.users[new_user_id] = {
-                    "password": hash_password(new_user_pwd),
-                    "role": new_user_role,
-                    "name": new_user_name if new_user_name else new_user_id
-                }
-                st.success(f"User '{new_user_id}' created successfully!")
-                
-    with t2:
-        rem_user_id = st.selectbox("Select User to Remove", list(st.session_state.users.keys()))
-        if st.button("Delete User"):
-            if rem_user_id == st.session_state.username:
-                st.error("You cannot delete your own account.")
-            else:
-                del st.session_state.users[rem_user_id]
-                st.success(f"User '{rem_user_id}' removed.")
-                st.rerun()
-
-    with t3:
-        reset_user_id = st.selectbox("Select User to Reset", list(st.session_state.users.keys()))
-        reset_pwd = st.text_input("New Password for User", type="password")
-        if st.button("Force Password Reset"):
-            if not reset_pwd:
-                st.error("Please provide a new password.")
-            else:
-                st.session_state.users[reset_user_id]["password"] = hash_password(reset_pwd)
-                st.success(f"Password reset successfully for {reset_user_id}.")
+    st.subheader("Configured Defect Categories")
+    for cat in DEFECT_CATEGORIES:
+        st.markdown(f"- {cat}")
