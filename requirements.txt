@@ -6,3 +6,4 @@ Pillow
 plotly
 openpyxl
 cloudinary
+pillow-heif pyzbar
